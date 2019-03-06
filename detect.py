@@ -66,8 +66,16 @@ def detect(
 
         # Get detections
         with torch.no_grad():
+
             img = torch.from_numpy(img).unsqueeze(0).to(device)
-            # pred = torch.onnx._export(model, img, 'weights/model.onnx', verbose=True); return  # ONNX export
+            #pred = torch.onnx._export(model, img, 'weights/model.onnx', verbose=True); return  # ONNX export
+            if False:
+                # to see what the trace looks like...but it seems to have issues
+                # which cant be resolved easily
+                model.to(device)
+                trace, out = torch.jit.get_trace_graph(model, img)
+                print(trace)
+                exit(1)
             pred = model(img)
             pred = pred[pred[:, :, 4] > conf_thres]
 
