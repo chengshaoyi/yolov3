@@ -1,9 +1,11 @@
-from collections import defaultdict
-
+from collections import defaultdict, OrderedDict
 import torch.nn as nn
-
+from pruner.prunedirector.pytorch.dependency import save_tracker
 from utils.parse_config import *
 from utils.utils import *
+
+from yolov3_prune_utils import in_out_record, create_entries_for_conv_group, link_prev_io_entry_to_current_module, \
+    link_shortcut_siblings
 
 
 def create_modules(module_defs):
@@ -250,6 +252,8 @@ class YOLOLayer(nn.Module):
             return p.view(bs, self.nA * nG * nG, 5 + self.nC)
 
 
+
+
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
@@ -263,21 +267,92 @@ class Darknet(nn.Module):
         self.img_size = img_size
         self.loss_names = ['loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'nT', 'TP', 'FP', 'FPe', 'FN', 'TC']
 
-    def forward(self, x, targets=None, batch_report=False, var=0):
+    def forward(self, x, targets=None, batch_report=False, var=0, tracker=None, tracker_str_stack=''):
         self.losses = defaultdict(float)
         is_training = targets is not None
         layer_outputs = []
         output = []
-
+        # dependency instrumentation
+        tracker_str_stack_curtop = tracker_str_stack+'module_list:'
+        in_out_module_tracker= OrderedDict()
+        tracker_prev_module_name = None
+        # end of dependency instrumentation
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
+            tracker_str_stack_current = tracker_str_stack_curtop+str(i)+':'
             if module_def['type'] in ['convolutional', 'upsample', 'maxpool']:
+                # start dependency instrumentation
+                if tracker is not None:
+                    if module_def['type'] == 'convolutional':
+                        # we traverse what is in there and
+                        entry_module, exit_module = \
+                            create_entries_for_conv_group(module, tracker, tracker_str_stack_current)
+                        out_set = {exit_module}
+                        out_set.add(entry_module)
+                        exit_modules = [out_set]
+                        print(exit_modules)
+                        top_module = module
+                    else:
+                        entry_module = None
+                        exit_modules = in_out_module_tracker[tracker_prev_module_name].out_module_names
+                        top_module = in_out_module_tracker[tracker_prev_module_name].op
+
+                    in_out_module_tracker[tracker_str_stack_current] = in_out_record(
+                        in_module_name=entry_module,
+                        out_module_names= exit_modules,
+                        op=top_module
+                    )
+                # end dependency instrumentation
                 x = module(x)
             elif module_def['type'] == 'route':
                 layer_i = [int(x) for x in module_def['layers'].split(',')]
                 x = torch.cat([layer_outputs[i] for i in layer_i], 1)
+                # instrumentation begin
+                # we want to add proper dependencies between source and dests
+                # look for all the prev layers's name
+                if tracker is not None:
+                    tracker_in_out_source_names = []
+                    for k in layer_i:
+                        if k < 0:
+                            suffix = i+k
+                        else:
+                            suffix = k
+                        cur_source_tracker_name = tracker_str_stack_curtop+str(suffix)+':'
+                        tracker_in_out_source_names.append(cur_source_tracker_name)
+                    out_module_names =[]
+                    for tracker_in_out_source_name in tracker_in_out_source_names:
+                        cur_source_out = in_out_module_tracker[tracker_in_out_source_name]
+                        # confirm we dont have route going into another route
+                        assert len(cur_source_out.out_module_names) == 1,\
+                            "I thought this is only from sequential or shortcut"
+                        out_module_names.append(cur_source_out.out_module_names[0])
+
+                    in_out_module_tracker[tracker_str_stack_current] = in_out_record(
+                        in_module_name=None,
+                        out_module_names= out_module_names,
+                        op='route'
+                    )
+                # instrumentation end
             elif module_def['type'] == 'shortcut':
                 layer_i = int(module_def['from'])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
+                #instrumentation stuff
+                if tracker is not None:
+                    tracker_in_out_source_names = [tracker_str_stack_curtop+str(i-1)+':']
+                    suffix = layer_i if layer_i > 0 else i+layer_i
+                    tracker_in_out_source_names.append(tracker_str_stack_curtop + str(suffix) + ':')
+                    out_module_names = set()
+                    for tracker_in_out_source_name in tracker_in_out_source_names:
+                        cur_source_out = in_out_module_tracker[tracker_in_out_source_name]
+                        assert len(cur_source_out.out_module_names) == 1, \
+                            "I thought this is only from sequential or shortcut"
+                        out_module_names = out_module_names.union(cur_source_out.out_module_names[0])
+                    in_out_module_tracker[tracker_str_stack_current] = in_out_record(
+                        in_module_name=None,
+                        out_module_names= [out_module_names],
+                        op='shortcut'
+                    )
+
+                #end of instrumentation
             elif module_def['type'] == 'yolo':
                 # Train phase: get loss
                 if is_training:
@@ -287,8 +362,60 @@ class Darknet(nn.Module):
                 # Test phase: Get detections
                 else:
                     x = module(x)
+                # instrumentation begin
+                if tracker is not None:
+                    in_out_module_tracker[tracker_str_stack_current] = in_out_record(
+                        in_module_name=None,
+                        out_module_names=None,
+                        op=module
+                    )
+                # instrumentation end
                 output.append(x)
             layer_outputs.append(x)
+
+            tracker_prev_module_name = tracker_str_stack_current
+
+        # instrumentation
+        # go through all short_cut layer's out_module_name and form cliques...put them into each short_cut layer's out_module_name
+
+        shortcuts = {}
+        for module_group_name, module_group_content in in_out_module_tracker.items():
+            if module_group_content.op == 'shortcut':
+                shortcuts[module_group_name] = module_group_content.out_module_names[0]
+
+        for module_group_name, module_group_content in in_out_module_tracker.items():
+            if module_group_content.op == 'shortcut':
+                module_group_out_name_set = module_group_content.out_module_names[0]
+                for shortcut_name, shortcut_members  in shortcuts.items():
+                    if len(module_group_out_name_set & shortcut_members) != 0:
+                        module_group_out_name_set.update(shortcut_members)
+            elif module_group_content.op == 'route':
+                for route_group_name_set in module_group_content.out_module_names:
+                    for shortcut_name, shortcut_members in shortcuts.items():
+                        if len(route_group_name_set & shortcut_members) != 0:
+                            route_group_name_set.update(shortcut_members)
+        # go through the layers in in_out_module_tracker
+        prev_module_content = None
+        for module_group_name, module_group_content in in_out_module_tracker.items():
+            entry_module = module_group_content.in_module_name
+            if entry_module is not None and prev_module_content is not None:
+                # we gonna build the link from the prev layer to this layer
+                link_prev_io_entry_to_current_module(tracker, prev_module_content, entry_module, self)
+            prev_module_content = module_group_content
+
+        set_of_sibling_sets = []
+        for shortcut_name, shortcut_members in shortcuts.items():
+            if shortcut_members not in set_of_sibling_sets:
+                set_of_sibling_sets.append(shortcut_members)
+
+        for cur_clique in set_of_sibling_sets:
+            print(cur_clique)
+            print(len(cur_clique))
+        for cur_clique in set_of_sibling_sets:
+            link_shortcut_siblings(tracker, cur_clique, self)
+        # go through all all route and go through all the shortcut's set, if there is intersect, we update its
+        save_tracker( tracker, 'yolov3.obj')
+        # end of instrumentation
 
         if is_training:
             if batch_report:
@@ -321,6 +448,12 @@ class Darknet(nn.Module):
             output = output[0].squeeze().transpose(0, 1)  # first layer reshaped to 85 x 507
             output[5:] = torch.nn.functional.softmax(torch.sigmoid(output[5:]) * output[4:5], dim=0)  # SSD-like conf
             return output[5:], output[:4]  # ONNX scores, boxes
+        #print("===================================")
+        #for out_module_name, out_module_content in in_out_module_tracker.items():
+        #    print(out_module_name)
+
+        #    print(out_module_content.out_module_names)
+        #    print(out_module_content.op)
 
         return sum(output) if is_training else torch.cat(output, 1)
 

@@ -6,7 +6,7 @@ from utils.datasets import *
 from utils.utils import *
 
 from utils import torch_utils
-
+from yolov3_prune_utils import *
 
 def detect(
         net_config_path,
@@ -76,7 +76,8 @@ def detect(
                 trace, out = torch.jit.get_trace_graph(model, img)
                 print(trace)
                 exit(1)
-            pred = model(img)
+            prune_tracker = PruneTracker()
+            pred = model(img, tracker=prune_tracker)
             pred = pred[pred[:, :, 4] > conf_thres]
 
             if len(pred) > 0:
