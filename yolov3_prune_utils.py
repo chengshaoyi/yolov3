@@ -119,3 +119,8 @@ def link_shortcut_siblings(tracker:PruneTracker, sibling_set, model):
                     assert False, 'unexpected sibling'
         else:
             assert False, 'only conv2d and batchnorm2d is allowed'
+
+
+def prune_segment_from_layer(tracker:PruneTracker, layer_name, segment):
+    pass
+
