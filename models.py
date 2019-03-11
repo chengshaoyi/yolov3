@@ -1,4 +1,7 @@
 from collections import defaultdict, OrderedDict
+import os
+from collections import defaultdict
+
 import torch.nn as nn
 from pruner.prunedirector.pytorch.dependency import save_tracker
 from utils.parse_config import *
@@ -6,6 +9,7 @@ from utils.utils import *
 
 from yolov3_prune_utils import in_out_record, create_entries_for_conv_group, link_prev_io_entry_to_current_module, \
     link_shortcut_siblings
+ONNX_EXPORT = False
 
 
 def create_modules(module_defs):
@@ -15,6 +19,7 @@ def create_modules(module_defs):
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams['channels'])]
     module_list = nn.ModuleList()
+    yolo_layer_count = 0
     for i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
@@ -44,7 +49,7 @@ def create_modules(module_defs):
 
         elif module_def['type'] == 'upsample':
             # upsample = nn.Upsample(scale_factor=int(module_def['stride']), mode='nearest')  # WARNING: deprecated
-            upsample = Upsample(scale_factor=int(module_def['stride']), mode='nearest')
+            upsample = Upsample(scale_factor=int(module_def['stride']))
             modules.add_module('upsample_%d' % i, upsample)
 
         elif module_def['type'] == 'route':
@@ -62,11 +67,12 @@ def create_modules(module_defs):
             anchors = [float(x) for x in module_def['anchors'].split(',')]
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
-            num_classes = int(module_def['classes'])
-            img_height = int(hyperparams['height'])
+            nC = int(module_def['classes'])  # number of classes
+            img_size = int(hyperparams['height'])
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_height, anchor_idxs, cfg=hyperparams['cfg'])
+            yolo_layer = YOLOLayer(anchors, nC, img_size, yolo_layer_count, cfg=hyperparams['cfg'])
             modules.add_module('yolo_%d' % i, yolo_layer)
+            yolo_layer_count += 1
 
         # Register module list and number of output filters
         module_list.append(modules)
@@ -81,8 +87,11 @@ class EmptyLayer(nn.Module):
     def __init__(self):
         super(EmptyLayer, self).__init__()
 
+    def forward(self, x):
+        return x
 
-class Upsample(torch.nn.Module):
+
+class Upsample(nn.Module):
     # Custom Upsample layer (nn.Upsample gives deprecated warning message)
 
     def __init__(self, scale_factor=1, mode='nearest'):
@@ -91,58 +100,48 @@ class Upsample(torch.nn.Module):
         self.mode = mode
 
     def forward(self, x):
-        return nn.functional.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
 
 
 class YOLOLayer(nn.Module):
-
-    def __init__(self, anchors, nC, img_dim, anchor_idxs, cfg):
+    def __init__(self, anchors, nC, img_size, yolo_layer, cfg):
         super(YOLOLayer, self).__init__()
 
-        anchors = [(a_w, a_h) for a_w, a_h in anchors]  # (pixels)
         nA = len(anchors)
-
-        self.anchors = anchors
+        self.anchors = torch.FloatTensor(anchors)
         self.nA = nA  # number of anchors (3)
         self.nC = nC  # number of classes (80)
-        self.bbox_attrs = 5 + nC
-        self.img_dim = img_dim  # from hyperparams in cfg file, NOT from parser
+        self.img_size = 0
+        # self.coco_class_weights = coco_class_weights()
 
-        if anchor_idxs[0] == (nA * 2):  # 6
-            stride = 32
-        elif anchor_idxs[0] == nA:  # 3
-            stride = 16
+        if ONNX_EXPORT:  # grids must be computed in __init__
+            stride = [32, 16, 8][yolo_layer]  # stride of this layer
+            if cfg.endswith('yolov3-tiny.cfg'):
+                stride *= 2
+
+            self.nG = int(img_size / stride)  # number grid points
+            create_grids(self, img_size, self.nG)
+
+    def forward(self, p, img_size, targets=None, var=None):
+        if ONNX_EXPORT:
+            bs, nG = 1, self.nG  # batch size, grid size
         else:
-            stride = 8
+            bs, nG = p.shape[0], p.shape[-1]
 
-        if cfg.endswith('yolov3-tiny.cfg'):
-            stride *= 2
+            if self.img_size != img_size:
+                create_grids(self, img_size, nG)
 
-        # Build anchor grids
-        nG = int(self.img_dim / stride)  # number grid points
-        self.grid_x = torch.arange(nG).repeat(nG, 1).view([1, 1, nG, nG]).float()
-        self.grid_y = torch.arange(nG).repeat(nG, 1).t().view([1, 1, nG, nG]).float()
-        self.scaled_anchors = torch.FloatTensor([(a_w / stride, a_h / stride) for a_w, a_h in anchors])
-        self.anchor_w = self.scaled_anchors[:, 0:1].view((1, nA, 1, 1))
-        self.anchor_h = self.scaled_anchors[:, 1:2].view((1, nA, 1, 1))
-        self.weights = class_weights()
+                if p.is_cuda:
+                    self.grid_xy = self.grid_xy.cuda()
+                    self.anchor_wh = self.anchor_wh.cuda()
 
-        self.loss_means = torch.ones(6)
-        self.tx, self.ty, self.tw, self.th = [], [], [], []
-        self.yolo_layer = anchor_idxs[0] / nA  # 2, 1, 0
+        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 80)  # (bs, anchors, grid, grid, classes + xywh)
+        p = p.view(bs, self.nA, self.nC + 5, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
-    def forward(self, p, targets=None, batch_report=False, var=None):
-        FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
-        bs = p.shape[0]  # batch size
-        nG = p.shape[2]  # number of grid points
-
-        if p.is_cuda and not self.grid_x.is_cuda:
-            self.grid_x, self.grid_y = self.grid_x.cuda(), self.grid_y.cuda()
-            self.anchor_w, self.anchor_h = self.anchor_w.cuda(), self.anchor_h.cuda()
-            self.weights, self.loss_means = self.weights.cuda(), self.loss_means.cuda()
-
-        # p.view(12, 255, 13, 13) -- > (12, 3, 13, 13, 80)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.nA, self.bbox_attrs, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
+        # xy, width and height
+        xy = torch.sigmoid(p[..., 0:2])
+        wh = p[..., 2:4]  # wh (yolo method)
+        # wh = torch.sigmoid(p[..., 2:4])  # wh (power method)
 
         # Training
         if targets is not None:
@@ -151,105 +150,68 @@ class YOLOLayer(nn.Module):
             CrossEntropyLoss = nn.CrossEntropyLoss()
 
             # Get outputs
-            x = torch.sigmoid(p[..., 0])  # Center x
-            y = torch.sigmoid(p[..., 1])  # Center y
             p_conf = p[..., 4]  # Conf
             p_cls = p[..., 5:]  # Class
 
-            # Width and height (yolo method)
-            w = p[..., 2]  # Width
-            h = p[..., 3]  # Height
-            width = torch.exp(w.data) * self.anchor_w
-            height = torch.exp(h.data) * self.anchor_h
-
-            # Width and height (power method)
-            # w = torch.sigmoid(p[..., 2])  # Width
-            # h = torch.sigmoid(p[..., 3])  # Height
-            # width = ((w.data * 2) ** 2) * self.anchor_w
-            # height = ((h.data * 2) ** 2) * self.anchor_h
-
-            p_boxes = None
-            if batch_report:
-                # Predicted boxes: add offset and scale with anchors (in grid space, i.e. 0-13)
-                gx = x.data + self.grid_x[:, :, :nG, :nG]
-                gy = y.data + self.grid_y[:, :, :nG, :nG]
-                p_boxes = torch.stack((gx - width / 2,
-                                       gy - height / 2,
-                                       gx + width / 2,
-                                       gy + height / 2), 4)  # x1y1x2y2
-
-            tx, ty, tw, th, mask, tcls, TP, FP, FN, TC = \
-                build_targets(p_boxes, p_conf, p_cls, targets, self.scaled_anchors, self.nA, self.nC, nG, batch_report)
+            txy, twh, mask, tcls = build_targets(targets, self.anchor_vec, self.nA, self.nC, nG)
 
             tcls = tcls[mask]
-            if x.is_cuda:
-                tx, ty, tw, th, mask, tcls = tx.cuda(), ty.cuda(), tw.cuda(), th.cuda(), mask.cuda(), tcls.cuda()
+            if p.is_cuda:
+                txy, twh, mask, tcls = txy.cuda(), twh.cuda(), mask.cuda(), tcls.cuda()
 
             # Compute losses
             nT = sum([len(x) for x in targets])  # number of targets
             nM = mask.sum().float()  # number of anchors (assigned to targets)
-            nB = len(targets)  # batch size
-            k = nM / nB
+            k = 1  # nM / bs
             if nM > 0:
-                lx = k * MSELoss(x[mask], tx[mask])
-                ly = k * MSELoss(y[mask], ty[mask])
-                lw = k * MSELoss(w[mask], tw[mask])
-                lh = k * MSELoss(h[mask], th[mask])
-
-                # self.tx.extend(tx[mask].data.numpy())
-                # self.ty.extend(ty[mask].data.numpy())
-                # self.tw.extend(tw[mask].data.numpy())
-                # self.th.extend(th[mask].data.numpy())
-                # print([np.mean(self.tx), np.std(self.tx)],[np.mean(self.ty), np.std(self.ty)],[np.mean(self.tw), np.std(self.tw)],[np.mean(self.th), np.std(self.th)])
-                # [0.5040668, 0.2885492] [0.51384246, 0.28328574] [-0.4754091, 0.57951087] [-0.25998235, 0.44858757]
-                # [0.50184494, 0.2858976] [0.51747805, 0.2896323] [0.12962963, 0.6263085] [-0.2722081, 0.61574113]
-                # [0.5032071, 0.28825334] [0.5063132, 0.2808862] [0.21124361, 0.44760725] [0.35445485, 0.6427766]
-                # import matplotlib.pyplot as plt
-                # plt.hist(self.x)
-
-                # lconf = k * BCEWithLogitsLoss(p_conf[mask], mask[mask].float())
+                lxy = k * MSELoss(xy[mask], txy[mask])
+                lwh = k * MSELoss(wh[mask], twh[mask])
 
                 lcls = (k / 4) * CrossEntropyLoss(p_cls[mask], torch.argmax(tcls, 1))
                 # lcls = (k * 10) * BCEWithLogitsLoss(p_cls[mask], tcls.float())
             else:
-                lx, ly, lw, lh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
+                FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
+                lxy, lwh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0])
 
-            # lconf += k * BCEWithLogitsLoss(p_conf[~mask], mask[~mask].float())
             lconf = (k * 64) * BCEWithLogitsLoss(p_conf, mask.float())
 
             # Sum loss components
-            balance_losses_flag = False
-            if balance_losses_flag:
-                k = 1 / self.loss_means.clone()
-                loss = (lx * k[0] + ly * k[1] + lw * k[2] + lh * k[3] + lconf * k[4] + lcls * k[5]) / k.mean()
+            loss = lxy + lwh + lconf + lcls
 
-                self.loss_means = self.loss_means * 0.99 + \
-                                  FT([lx.data, ly.data, lw.data, lh.data, lconf.data, lcls.data]) * 0.01
-            else:
-                loss = lx + ly + lw + lh + lconf + lcls
-
-            # Sum False Positives from unassigned anchors
-            FPe = torch.zeros(self.nC)
-            if batch_report:
-                i = torch.sigmoid(p_conf[~mask]) > 0.5
-                if i.sum() > 0:
-                    FP_classes = torch.argmax(p_cls[~mask][i], 1)
-                    FPe = torch.bincount(FP_classes, minlength=self.nC).float().cpu()  # extra FPs
-
-            return loss, loss.item(), lx.item(), ly.item(), lw.item(), lh.item(), lconf.item(), lcls.item(), \
-                   nT, TP, FP, FPe, FN, TC
+            return loss, loss.item(), lxy.item(), lwh.item(), lconf.item(), lcls.item(), nT
 
         else:
-            stride = self.img_dim / nG
-            p[..., 0] = torch.sigmoid(p[..., 0]) + self.grid_x  # x
-            p[..., 1] = torch.sigmoid(p[..., 1]) + self.grid_y  # y
-            p[..., 2] = torch.exp(p[..., 2]) * self.anchor_w  # width
-            p[..., 3] = torch.exp(p[..., 3]) * self.anchor_h  # height
+            if ONNX_EXPORT:
+                grid_xy = self.grid_xy.repeat((1, self.nA, 1, 1, 1)).view((1, -1, 2))
+                anchor_wh = self.anchor_wh.repeat((1, 1, nG, nG, 1)).view((1, -1, 2)) / nG
+
+                # p = p.view(-1, 85)
+                # xy = xy + self.grid_xy[0]  # x, y
+                # wh = torch.exp(wh) * self.anchor_wh[0]  # width, height
+                # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
+                # p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
+                # return torch.cat((xy / nG, wh, p_conf, p_cls), 1).t()
+
+                p = p.view(1, -1, 85)
+                xy = xy + grid_xy  # x, y
+                wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
+                p_conf = torch.sigmoid(p[..., 4:5])  # Conf
+                p_cls = p[..., 5:85]
+                # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
+                # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
+                p_cls = torch.exp(p_cls).permute((2, 1, 0))
+                p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
+                p_cls = p_cls.permute(2, 1, 0)
+                return torch.cat((xy / nG, wh, p_conf, p_cls), 2).squeeze().t()
+
+            p[..., 0:2] = xy + self.grid_xy  # xy
+            p[..., 2:4] = torch.exp(wh) * self.anchor_wh  # wh yolo method
+            # p[..., 2:4] = ((wh * 2) ** 2) * self.anchor_wh  # wh power method
             p[..., 4] = torch.sigmoid(p[..., 4])  # p_conf
-            p[..., :4] *= stride
+            p[..., :4] *= self.stride
 
             # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
-            return p.view(bs, self.nA * nG * nG, 5 + self.nC)
+            return p.view(bs, -1, 5 + self.nC)
 
 
 
@@ -260,16 +222,18 @@ class Darknet(nn.Module):
     def __init__(self, cfg_path, img_size=416):
         super(Darknet, self).__init__()
 
-        self.module_defs = parse_model_config(cfg_path)
+        self.module_defs = parse_model_cfg(cfg_path)
         self.module_defs[0]['cfg'] = cfg_path
         self.module_defs[0]['height'] = img_size
         self.hyperparams, self.module_list = create_modules(self.module_defs)
         self.img_size = img_size
-        self.loss_names = ['loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'nT', 'TP', 'FP', 'FPe', 'FN', 'TC']
+        self.loss_names = ['loss', 'xy', 'wh', 'conf', 'cls', 'nT']
+        self.losses = []
 
-    def forward(self, x, targets=None, batch_report=False, var=0, tracker=None, tracker_str_stack=''):
+    def forward(self, x, targets=None, var=0, tracker=None, tracker_str_stack=''):
         self.losses = defaultdict(float)
         is_training = targets is not None
+        img_size = x.shape[-1]
         layer_outputs = []
         output = []
         # dependency instrumentation
@@ -279,7 +243,8 @@ class Darknet(nn.Module):
         # end of dependency instrumentation
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             tracker_str_stack_current = tracker_str_stack_curtop+str(i)+':'
-            if module_def['type'] in ['convolutional', 'upsample', 'maxpool']:
+            mtype = module_def['type']
+            if mtype in ['convolutional', 'upsample', 'maxpool']:
                 # start dependency instrumentation
                 if tracker is not None:
                     if module_def['type'] == 'convolutional':
@@ -303,7 +268,7 @@ class Darknet(nn.Module):
                     )
                 # end dependency instrumentation
                 x = module(x)
-            elif module_def['type'] == 'route':
+            elif mtype == 'route':
                 layer_i = [int(x) for x in module_def['layers'].split(',')]
                 x = torch.cat([layer_outputs[i] for i in layer_i], 1)
                 # instrumentation begin
@@ -332,7 +297,7 @@ class Darknet(nn.Module):
                         op='route'
                     )
                 # instrumentation end
-            elif module_def['type'] == 'shortcut':
+            elif mtype == 'shortcut':
                 layer_i = int(module_def['from'])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
                 #instrumentation stuff
@@ -353,15 +318,13 @@ class Darknet(nn.Module):
                     )
 
                 #end of instrumentation
-            elif module_def['type'] == 'yolo':
-                # Train phase: get loss
-                if is_training:
-                    x, *losses = module[0](x, targets, batch_report, var)
+            elif mtype == 'yolo':
+                if is_training:  # get loss
+                    x, *losses = module[0](x, img_size, targets, var)
                     for name, loss in zip(self.loss_names, losses):
                         self.losses[name] += loss
-                # Test phase: Get detections
-                else:
-                    x = module(x)
+                else:  # get detections
+                    x = module[0](x, img_size)
                 # instrumentation begin
                 if tracker is not None:
                     in_out_module_tracker[tracker_str_stack_current] = in_out_record(
@@ -414,33 +377,12 @@ class Darknet(nn.Module):
         for cur_clique in set_of_sibling_sets:
             link_shortcut_siblings(tracker, cur_clique, self)
         # go through all all route and go through all the shortcut's set, if there is intersect, we update its
-        save_tracker( tracker, 'yolov3.obj')
+        if tracker is not None:
+            save_tracker( tracker, 'yolov3.obj')
         # end of instrumentation
 
         if is_training:
-            if batch_report:
-                self.losses['TC'] /= 3  # target category
-                metrics = torch.zeros(3, len(self.losses['FPe']))  # TP, FP, FN
-
-                ui = np.unique(self.losses['TC'])[1:]
-                for i in ui:
-                    j = self.losses['TC'] == float(i)
-                    metrics[0, i] = (self.losses['TP'][j] > 0).sum().float()  # TP
-                    metrics[1, i] = (self.losses['FP'][j] > 0).sum().float()  # FP
-                    metrics[2, i] = (self.losses['FN'][j] == 3).sum().float()  # FN
-                metrics[1] += self.losses['FPe']
-
-                self.losses['TP'] = metrics[0].sum()
-                self.losses['FP'] = metrics[1].sum()
-                self.losses['FN'] = metrics[2].sum()
-                self.losses['metrics'] = metrics
-            else:
-                self.losses['TP'] = 0
-                self.losses['FP'] = 0
-                self.losses['FN'] = 0
-
             self.losses['nT'] /= 3
-            self.losses['TC'] = 0
 
         ONNX_export = False
         if ONNX_export:
@@ -458,21 +400,50 @@ class Darknet(nn.Module):
         return sum(output) if is_training else torch.cat(output, 1)
 
 
-def load_weights(self, weights_path, cutoff=-1):
-    # Parses and loads the weights stored in 'weights_path'
-    # @:param cutoff  - save layers between 0 and cutoff (cutoff = -1 -> all are saved)
+def get_yolo_layers(model):
+    a = [module_def['type'] == 'yolo' for module_def in model.module_defs]
+    return [i for i, x in enumerate(a) if x]  # [82, 94, 106] for yolov3
 
-    if weights_path.endswith('darknet53.conv.74'):
+
+def create_grids(self, img_size, nG):
+    self.stride = img_size / nG
+
+    # build xy offsets
+    grid_x = torch.arange(nG).repeat((nG, 1)).view((1, 1, nG, nG)).float()
+    grid_y = grid_x.permute(0, 1, 3, 2)
+    self.grid_xy = torch.stack((grid_x, grid_y), 4)
+
+    # build wh gains
+    self.anchor_vec = self.anchors / self.stride
+    self.anchor_wh = self.anchor_vec.view(1, self.nA, 1, 1, 2)
+
+
+def load_darknet_weights(self, weights, cutoff=-1):
+    # Parses and loads the weights stored in 'weights'
+    # cutoff: save layers between 0 and cutoff (if cutoff = -1 all are saved)
+    weights_file = weights.split(os.sep)[-1]
+
+    # Try to download weights if not available locally
+    if not os.path.isfile(weights):
+        try:
+            os.system('wget https://pjreddie.com/media/files/' + weights_file + ' -O ' + weights)
+        except IOError:
+            print(weights + ' not found')
+
+    # Establish cutoffs
+    if weights_file == 'darknet53.conv.74':
         cutoff = 75
+    elif weights_file == 'yolov3-tiny.conv.15':
+        cutoff = 15
 
     # Open the weights file
-    fp = open(weights_path, 'rb')
+    fp = open(weights, 'rb')
     header = np.fromfile(fp, dtype=np.int32, count=5)  # First five are header values
 
     # Needed to write header when saving weights
     self.header_info = header
 
-    self.seen = header[3]
+    self.seen = header[3]  # number of images seen during training
     weights = np.fromfile(fp, dtype=np.float32)  # The rest are weights
     fp.close()
 
@@ -521,7 +492,7 @@ def load_weights(self, weights_path, cutoff=-1):
 
 def save_weights(self, path, cutoff=-1):
     fp = open(path, 'wb')
-    self.header_info[3] = self.seen
+    self.header_info[3] = self.seen  # number of images seen during training
     self.header_info.tofile(fp)
 
     # Iterate through layers

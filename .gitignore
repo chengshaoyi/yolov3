@@ -8,13 +8,16 @@
 *.PNG
 *.TIF
 *.HEIC
-!zidane_result.jpg
-!coco_training_loss.png
-!coco_augmentation_examples.jpg
+*.data
+*.cfg
+data/*
+!cfg/coco.data
+!cfg/yolov3*.cfg
 !data/samples/zidane.jpg
+!data/coco.names
+!data/coco_paper.names
 
 results*.txt
-temp-plot.html
 
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~
@@ -27,6 +30,7 @@ temp-plot.html
 *.onnx
 *.mlmodel
 darknet53.conv.74
+yolov3-tiny.conv.15
 
 # GitHub Python GitIgnore ----------------------------------------------------------------------------------------------
 # Byte-compiled / optimized / DLL files

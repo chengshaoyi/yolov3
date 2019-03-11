@@ -1,21 +1,36 @@
-<img src="https://storage.googleapis.com/ultralytics/logo/logoname1000.png" width="200">
+<table style="width:100%">
+  <tr>
+    <th><img src="https://user-images.githubusercontent.com/26833433/52743528-e6096300-2fe2-11e9-970c-5fee45769fab.jpg" width="400"></th>
+    <th><img src="https://storage.googleapis.com/ultralytics/logo/logoname1000.png" width="200">
+  <br><br/>
+  <p> <a href="https://itunes.apple.com/app/id1452689527">
+  <img href="https://itunes.apple.com/app/id1452689527" src="https://user-images.githubusercontent.com/26833433/50044365-9b22ac00-0082-11e9-862f-e77aee7aa7b0.png" width="180"> 
+  </a> </p></th> 
+  </tr>
+</table>
 
 # Introduction
 
-This directory contains software developed by Ultralytics LLC, and **is freely available for redistribution under the GPL-3.0 license**. For more information on Ultralytics projects please visit:
-https://www.ultralytics.com.
+This directory contains python software and an iOS App developed by Ultralytics LLC, and **is freely available for redistribution under the GPL-3.0 license**. For more information please visit https://www.ultralytics.com.
 
 # Description
 
-The https://github.com/ultralytics/yolov3 repo contains inference and training code for YOLOv3 in PyTorch. Training is done on the COCO dataset by default: https://cocodataset.org/#home. **Credit to Joseph Redmon for YOLO** (https://pjreddie.com/darknet/yolo/) and to **Erik Lindernoren for the PyTorch implementation** this work is based on (https://github.com/eriklindernoren/PyTorch-YOLOv3).
+The https://github.com/ultralytics/yolov3 repo contains inference and training code for YOLOv3 in PyTorch. The code works on Linux, MacOS and Windows. Training is done on the COCO dataset by default: https://cocodataset.org/#home. **Credit to Joseph Redmon for YOLO** (https://pjreddie.com/darknet/yolo/) and to **Erik Lindernoren for the PyTorch implementation** this work is based on (https://github.com/eriklindernoren/PyTorch-YOLOv3).
 
 # Requirements
 
 Python 3.7 or later with the following `pip3 install -U -r requirements.txt` packages:
 
 - `numpy`
-- `torch`
+- `torch >= 1.0.0`
 - `opencv-python`
+
+# Tutorials
+
+* [Transfer Learning](https://github.com/ultralytics/yolov3/wiki/Example:-Transfer-Learning)
+* [Train Single Image](https://github.com/ultralytics/yolov3/wiki/Example:-Train-Single-Image)
+* [Train Single Class](https://github.com/ultralytics/yolov3/wiki/Example:-Train-Single-Class)
+* [Train Custom Data](https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data)
 
 # Training
 
@@ -23,9 +38,10 @@ Python 3.7 or later with the following `pip3 install -U -r requirements.txt` pac
 
 **Resume Training:** Run `train.py --resume` to resume training from the most recently saved checkpoint `weights/latest.pt`.
 
-Each epoch trains on 120,000 images from the train and validate COCO sets, and tests on 5000 images from the COCO validate set. Default training settings produce loss plots below, with **training speed of 0.6 s/batch on a 1080 Ti (15 epochs/day)** or 0.45 s/batch on a 2080 Ti.
+Each epoch trains on 120,000 images from the train and validate COCO sets, and tests on 5000 images from the COCO validate set. Default training settings produce loss plots below, with **training speed of 0.6 s/batch on a 1080 Ti (18 epochs/day)** or 0.45 s/batch on a 2080 Ti.
 
-![Alt](https://user-images.githubusercontent.com/26833433/49822374-3b27bf00-fd7d-11e8-9180-f0ac9fe2fdb4.png "coco training loss")
+`from utils import utils; utils.plot_results()`
+![Alt](https://user-images.githubusercontent.com/26833433/53494085-3251aa00-3a9d-11e9-8af7-8c08cf40d70b.png "train.py results")
 
 ## Image Augmentation
 
@@ -45,13 +61,17 @@ HS**V** Intensity | +/- 50%
 
 # Inference
 
-Run `detect.py` to apply trained weights to an image and visualize results, such as `zidane.jpg` from the `data/samples` folder, shown here. 
+Run `detect.py` to apply trained weights to an image, such as `zidane.jpg` from the `data/samples` folder:
 
 **YOLOv3:** `detect.py --cfg cfg/yolov3.cfg --weights weights/yolov3.pt`
 <img src="https://user-images.githubusercontent.com/26833433/50524393-b0adc200-0ad5-11e9-9335-4774a1e52374.jpg" width="800">
 
 **YOLOv3-tiny:** `detect.py --cfg cfg/yolov3-tiny.cfg --weights weights/yolov3-tiny.pt`
 <img src="https://user-images.githubusercontent.com/26833433/50374155-21427380-05ea-11e9-8d24-f1a4b2bac1ad.jpg" width="800">
+
+## Webcam
+
+Run `detect.py` with `webcam=True` to show a live webcam feed.
 
 # Pretrained Weights
 
@@ -62,7 +82,7 @@ Download official YOLOv3 weights:
 - https://pjreddie.com/media/files/yolov3-tiny.weights
 
 **PyTorch** format:
-- https://drive.google.com/drive/u/0/folders/1uxgUBemJVw9wZsdpboYbzUN4bcRhsuAI
+- https://drive.google.com/drive/folders/1uxgUBemJVw9wZsdpboYbzUN4bcRhsuAI
 
 # Validation mAP
 

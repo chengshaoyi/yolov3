@@ -2,7 +2,6 @@ import glob
 import math
 import os
 import random
-from sys import platform
 
 import cv2
 import numpy as np
@@ -12,23 +11,19 @@ import torch
 from utils.utils import xyxy2xywh
 
 
-class load_images():  # for inference
-    def __init__(self, path, batch_size=1, img_size=416):
+class LoadImages:  # for inference
+    def __init__(self, path, img_size=416):
         if os.path.isdir(path):
+            image_format = ['.jpg', '.jpeg', '.png', '.tif']
             self.files = sorted(glob.glob('%s/*.*' % path))
+            self.files = list(filter(lambda x: os.path.splitext(x)[1].lower() in image_format, self.files))
         elif os.path.isfile(path):
             self.files = [path]
 
         self.nF = len(self.files)  # number of image files
-        self.nB = math.ceil(self.nF / batch_size)  # number of batches
-        self.batch_size = batch_size
         self.height = img_size
 
-        assert self.nF > 0, 'No images found in path %s' % path
-
-        # RGB normalization values
-        # self.rgb_mean = np.array([60.134, 49.697, 40.746], dtype=np.float32).reshape((3, 1, 1))
-        # self.rgb_std = np.array([29.99, 24.498, 22.046], dtype=np.float32).reshape((3, 1, 1))
+        assert self.nF > 0, 'No images found in ' + path
 
     def __iter__(self):
         self.count = -1
@@ -36,39 +31,73 @@ class load_images():  # for inference
 
     def __next__(self):
         self.count += 1
-        if self.count == self.nB:
+        if self.count == self.nF:
             raise StopIteration
         img_path = self.files[self.count]
 
         # Read image
-        img = cv2.imread(img_path)  # BGR
+        img0 = cv2.imread(img_path)  # BGR
+        assert img0 is not None, 'File Not Found ' + img_path
 
         # Padded resize
-        img, _, _, _ = resize_square(img, height=self.height, color=(127.5, 127.5, 127.5))
+        img, _, _, _ = letterbox(img0, height=self.height)
 
         # Normalize RGB
         img = img[:, :, ::-1].transpose(2, 0, 1)
         img = np.ascontiguousarray(img, dtype=np.float32)
-        # img -= self.rgb_mean
-        # img /= self.rgb_std
         img /= 255.0
 
-        return [img_path], img
+        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
+        return img_path, img, img0
 
     def __len__(self):
-        return self.nB  # number of batches
+        return self.nF  # number of files
 
 
-class load_images_and_labels():  # for training
+class LoadWebcam:  # for inference
+    def __init__(self, img_size=416):
+        self.cam = cv2.VideoCapture(0)
+        self.height = img_size
+
+    def __iter__(self):
+        self.count = -1
+        return self
+
+    def __next__(self):
+        self.count += 1
+        if cv2.waitKey(1) == 27:  # esc to quit
+            cv2.destroyAllWindows()
+            raise StopIteration
+
+        # Read image
+        ret_val, img0 = self.cam.read()
+        assert ret_val, 'Webcam Error'
+        img_path = 'webcam_%g.jpg' % self.count
+        img0 = cv2.flip(img0, 1)
+
+        # Padded resize
+        img, _, _, _ = letterbox(img0, height=self.height)
+
+        # Normalize RGB
+        img = img[:, :, ::-1].transpose(2, 0, 1)
+        img = np.ascontiguousarray(img, dtype=np.float32)
+        img /= 255.0
+
+        return img_path, img, img0
+
+    def __len__(self):
+        return 0
+
+
+class LoadImagesAndLabels:  # for training
     def __init__(self, path, batch_size=1, img_size=608, multi_scale=False, augment=False):
-        self.path = path
-        # self.img_files = sorted(glob.glob('%s/*.*' % path))
         with open(path, 'r') as file:
             self.img_files = file.readlines()
+            self.img_files = [x.replace('\n', '') for x in self.img_files]
+            self.img_files = list(filter(lambda x: len(x) > 0, self.img_files))
 
-        self.img_files = [path.replace('\n', '') for path in self.img_files]
-        self.label_files = [path.replace('images', 'labels').replace('.png', '.txt').replace('.jpg', '.txt') for path in
-                            self.img_files]
+        self.label_files = [x.replace('images', 'labels').replace('.png', '.txt').replace('.jpg', '.txt')
+                            for x in self.img_files]
 
         self.nF = len(self.img_files)  # number of image files
         self.nB = math.ceil(self.nF / batch_size)  # number of batches
@@ -77,11 +106,7 @@ class load_images_and_labels():  # for training
         self.multi_scale = multi_scale
         self.augment = augment
 
-        assert self.nB > 0, 'No images found in path %s' % path
-
-        # RGB normalization values
-        # self.rgb_mean = np.array([60.134, 49.697, 40.746], dtype=np.float32).reshape((1, 3, 1, 1))
-        # self.rgb_std = np.array([29.99, 24.498, 22.046], dtype=np.float32).reshape((1, 3, 1, 1))
+        assert self.nF > 0, 'No images found in %s' % path
 
     def __iter__(self):
         self.count = -1
@@ -103,15 +128,13 @@ class load_images_and_labels():  # for training
             # Fixed-Scale YOLO Training
             height = self.height
 
-        img_all = []
-        labels_all = []
+        img_all, labels_all, img_paths, img_shapes = [], [], [], []
         for index, files_index in enumerate(range(ia, ib)):
             img_path = self.img_files[self.shuffled_vector[files_index]]
             label_path = self.label_files[self.shuffled_vector[files_index]]
 
             img = cv2.imread(img_path)  # BGR
-            if img is None:
-                continue
+            assert img is not None, 'File Not Found ' + img_path
 
             augment_hsv = True
             if self.augment and augment_hsv:
@@ -136,7 +159,7 @@ class load_images_and_labels():  # for training
                 cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
 
             h, w, _ = img.shape
-            img, ratio, padw, padh = resize_square(img, height=height, color=(127.5, 127.5, 127.5))
+            img, ratio, padw, padh = letterbox(img, height=height)
 
             # Load labels
             if os.path.isfile(label_path):
@@ -185,30 +208,31 @@ class load_images_and_labels():  # for training
 
             img_all.append(img)
             labels_all.append(torch.from_numpy(labels))
+            img_paths.append(img_path)
+            img_shapes.append((h, w))
 
         # Normalize
         img_all = np.stack(img_all)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB and cv2 to pytorch
         img_all = np.ascontiguousarray(img_all, dtype=np.float32)
-        # img_all -= self.rgb_mean
-        # img_all /= self.rgb_std
         img_all /= 255.0
 
-        return torch.from_numpy(img_all), labels_all
+        return torch.from_numpy(img_all), labels_all, img_paths, img_shapes
 
     def __len__(self):
         return self.nB  # number of batches
 
 
-def resize_square(img, height=416, color=(0, 0, 0)):  # resize a rectangular image to a padded square
+def letterbox(img, height=416, color=(127.5, 127.5, 127.5)):  # resize a rectangular image to a padded square
     shape = img.shape[:2]  # shape = [height, width]
     ratio = float(height) / max(shape)  # ratio  = old / new
-    new_shape = [round(shape[0] * ratio), round(shape[1] * ratio)]
-    dw = height - new_shape[1]  # width padding
-    dh = height - new_shape[0]  # height padding
-    top, bottom = dh // 2, dh - (dh // 2)
-    left, right = dw // 2, dw - (dw // 2)
-    img = cv2.resize(img, (new_shape[1], new_shape[0]), interpolation=cv2.INTER_AREA)  # resized, no border
-    return cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color), ratio, dw // 2, dh // 2
+    new_shape = (round(shape[1] * ratio), round(shape[0] * ratio))
+    dw = (height - new_shape[0]) / 2  # width padding
+    dh = (height - new_shape[1]) / 2  # height padding
+    top, bottom = round(dh - 0.1), round(dh + 0.1)
+    left, right = round(dw - 0.1), round(dw + 0.1)
+    img = cv2.resize(img, new_shape, interpolation=cv2.INTER_AREA)  # resized, no border
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # padded square
+    return img, ratio, dw, dh
 
 
 def random_affine(img, targets=None, degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-2, 2),
