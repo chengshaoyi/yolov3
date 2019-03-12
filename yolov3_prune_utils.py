@@ -1,4 +1,5 @@
 from collections.__init__ import namedtuple
+from typing import Callable
 
 from torch import nn as nn
 
@@ -95,6 +96,28 @@ def link_prev_io_entry_to_current_module(tracker:PruneTracker,
         else:
             assert False, 'unrecognize possibility'
 
+def find_dst_with_prop(tracker:PruneTracker, src:str, prop:Callable, prop_cmp_neg=False):
+    dsts=[]
+    dst_fns = []
+
+    for pair in zip(tracker.dependency[src].dsts, tracker.dependency[src].dst_fns):
+        cur_dst, cur_dst_fn = pair[0],pair[1]
+        if (prop_cmp_neg and cur_dst_fn != prop) or (not prop_cmp_neg and cur_dst_fn == prop):
+            dsts.append(cur_dst)
+            dst_fns.append(cur_dst_fn)
+    return dsts,dst_fns
+
+
+def link_siblings_children(tracker:PruneTracker):
+    # for every src, if it is fanning out to some dst with o2o
+    # it is fanning out to that person's dst with o2i
+    for src in tracker.dependency.keys():
+        siblings, _ = find_dst_with_prop(tracker,src,simple_domain_propagate_o2o)
+        for sibling in siblings:
+            sibling_children, children_props = find_dst_with_prop(tracker,sibling,simple_domain_propagate_o2o, prop_cmp_neg=True)
+            #for sibling_child, sibling_child_prop in zip(sibling_children, children_props):
+            tracker.dependency[src].dsts.extend(sibling_children)
+            tracker.dependency[src].dst_fns.extend(children_props)
 
 def link_shortcut_siblings(tracker:PruneTracker, sibling_set, model):
     for cur_member in sibling_set:
@@ -125,6 +148,7 @@ def link_shortcut_siblings(tracker:PruneTracker, sibling_set, model):
 def prune_segment_from_layer(tracker:PruneTracker, layer_name, segment, model):
     updated_module_name_set = prune_module_domain(tracker, layer_name, [segment])
     regen_replace_modules_in_model(tracker, updated_module_name_set, module_factory_fn, model)
+
 
 
 

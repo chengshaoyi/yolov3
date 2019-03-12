@@ -8,7 +8,7 @@ from utils.parse_config import *
 from utils.utils import *
 
 from yolov3_prune_utils import in_out_record, create_entries_for_conv_group, link_prev_io_entry_to_current_module, \
-    link_shortcut_siblings
+    link_shortcut_siblings, link_siblings_children
 ONNX_EXPORT = False
 
 
@@ -267,7 +267,6 @@ class Darknet(nn.Module):
                         op=top_module
                     )
                 # end dependency instrumentation
-                #print(module)
                 x = module(x)
             elif mtype == 'route':
                 layer_i = [int(x) for x in module_def['layers'].split(',')]
@@ -377,7 +376,8 @@ class Darknet(nn.Module):
                 print(len(cur_clique))
         for cur_clique in set_of_sibling_sets:
             link_shortcut_siblings(tracker, cur_clique, self)
-        # go through all all route and go through all the shortcut's set, if there is intersect, we update its
+        if tracker is not None:
+            link_siblings_children(tracker)
         # end of instrumentation
 
         if is_training:

@@ -85,9 +85,11 @@ def run_pruner(
         model,tracker = initial_model_gen(cfg, img_size,weights)
     else:
         model,tracker = restore_pruned_checkpt(cfg, img_size, resume_prune_point)
+
+
     print("model created")
     # we prune and save dependency
-    prune_segment_from_layer(tracker,'module_list:0:conv_0',(1,20),model)
+    prune_segment_from_layer(tracker,'module_list:7:conv_7',(1,50),model)
     run_single_detect(model,images,img_size)
     print("tested current pruning section state")
 
