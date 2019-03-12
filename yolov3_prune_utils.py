@@ -5,7 +5,8 @@ from torch import nn as nn
 from pruner.core.domain_registry import init_domain_core_pytorch
 from pruner.domains.ioslicerbar.pytorch.propagator import simple_domain_propagate_o2io, simple_domain_propagate_o2i, \
     ConcatPropagateWrapper, simple_domain_propagate_o2o
-from pruner.prunedirector.pytorch.dependency import PruneTracker, init_dep_node, add_dep_dsts
+from pruner.prunedirector.pytorch.dependency import PruneTracker, init_dep_node, add_dep_dsts, prune_module_domain, \
+    regen_replace_modules_in_model
 from pruner.util.pytorch.module_traverse import get_submodule, get_module_comp_rec
 
 
@@ -40,7 +41,7 @@ def create_entries_for_conv_group(module, tracker:PruneTracker, tracker_str_stac
         if entry_module is None:
             entry_module = global_name
             entry_module_entity = submodule_entity
-        if cur_submodule_type == nn.Conv2d:
+        if cur_submodule_type == nn.Conv2d or cur_submodule_type == nn.BatchNorm2d:
             init_dep_node(tracker, global_name, submodule_entity, domain_factory_fn)
         if prev_module is not None:
             assert cur_submodule_type==nn.BatchNorm2d and type(prev_module_entity) == nn.Conv2d, 'unexpected relationship between conv layers'
@@ -121,6 +122,9 @@ def link_shortcut_siblings(tracker:PruneTracker, sibling_set, model):
             assert False, 'only conv2d and batchnorm2d is allowed'
 
 
-def prune_segment_from_layer(tracker:PruneTracker, layer_name, segment):
-    pass
+def prune_segment_from_layer(tracker:PruneTracker, layer_name, segment, model):
+    updated_module_name_set = prune_module_domain(tracker, layer_name, [segment])
+    regen_replace_modules_in_model(tracker, updated_module_name_set, module_factory_fn, model)
+
+
 

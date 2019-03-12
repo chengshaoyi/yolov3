@@ -254,7 +254,7 @@ class Darknet(nn.Module):
                         out_set = {exit_module}
                         out_set.add(entry_module)
                         exit_modules = [out_set]
-                        print(exit_modules)
+                        #print(exit_modules)
                         top_module = module
                     else:
                         entry_module = None
@@ -267,6 +267,7 @@ class Darknet(nn.Module):
                         op=top_module
                     )
                 # end dependency instrumentation
+                #print(module)
                 x = module(x)
             elif mtype == 'route':
                 layer_i = [int(x) for x in module_def['layers'].split(',')]
@@ -370,15 +371,13 @@ class Darknet(nn.Module):
         for shortcut_name, shortcut_members in shortcuts.items():
             if shortcut_members not in set_of_sibling_sets:
                 set_of_sibling_sets.append(shortcut_members)
-
-        for cur_clique in set_of_sibling_sets:
-            print(cur_clique)
-            print(len(cur_clique))
+        if False:
+            for cur_clique in set_of_sibling_sets:
+                print(cur_clique)
+                print(len(cur_clique))
         for cur_clique in set_of_sibling_sets:
             link_shortcut_siblings(tracker, cur_clique, self)
         # go through all all route and go through all the shortcut's set, if there is intersect, we update its
-        if tracker is not None:
-            save_tracker( tracker, 'yolov3.obj')
         # end of instrumentation
 
         if is_training:
